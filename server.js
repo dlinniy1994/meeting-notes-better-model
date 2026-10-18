@@ -5,7 +5,7 @@ app.use(express.json({ limit: '5mb' }));
 
 const PORT = process.env.PORT || 3000;
 const CLAUDE_API_KEY = process.env.CLAUDE_API_KEY;
-const CLAUDE_MODEL = process.env.CLAUDE_MODEL || 'claude-sonnet-4-6';
+const CLAUDE_MODEL = process.env.CLAUDE_MODEL || 'claude-sonnet-5-5';
 const REQUEST_TIMEOUT_MS = 120_000;
 
 if (!CLAUDE_API_KEY) {
