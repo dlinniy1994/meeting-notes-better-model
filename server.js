@@ -6,7 +6,9 @@ app.use(express.json({ limit: '5mb' }));
 const PORT = process.env.PORT || 3000;
 const CLAUDE_API_KEY = process.env.CLAUDE_API_KEY;
 const CLAUDE_MODEL = process.env.CLAUDE_MODEL || 'claude-sonnet-5-5';
-const REQUEST_TIMEOUT_MS = 120_000;
+const MAX_TOKENS = parseInt(process.env.CLAUDE_MAX_TOKENS || '16000', 10);
+const REQUEST_TIMEOUT_MS = 180_000;
+const DEBUG_RAW = process.env.DEBUG_RAW === 'true';
 
 if (!CLAUDE_API_KEY) {
   console.error('FATAL: CLAUDE_API_KEY не задан');
@@ -64,6 +66,12 @@ app.post('/process', async (req, res) => {
     });
   }
 
+  if (typeof transcript !== 'string') {
+    return res.status(400).json({
+      error: `transcript должен быть строкой, пришёл ${typeof transcript}`
+    });
+  }
+
   if (!isWebhookUrlSafe(webhook_url)) {
     return res.status(400).json({
       error: 'webhook_url должен быть https и публичным (не localhost / приватная сеть)'
@@ -82,6 +90,7 @@ app.get('/health', (req, res) => {
   res.json({
     status: 'ok',
     model: CLAUDE_MODEL,
+    max_tokens: MAX_TOKENS,
     timestamp: new Date().toISOString()
   });
 });
@@ -95,12 +104,16 @@ async function processTranscript(transcript, webhook_url, metadata) {
   console.log(`=== START === transcript_len=${transcript.length} meta=${JSON.stringify(metadata)}`);
 
   try {
-    const followup = await callClaude(transcript);
-    console.log(`[OK] followup_len=${followup.length} elapsed_ms=${Date.now() - startedAt}`);
+    const { text: followup, stop_reason, usage } = await callClaude(transcript);
+    console.log(
+      `[OK] followup_len=${followup.length} stop_reason=${stop_reason} ` +
+      `usage=${JSON.stringify(usage)} elapsed_ms=${Date.now() - startedAt}`
+    );
 
     await sendWebhook(webhook_url, {
       status: 'completed',
       followup_md: followup,
+      truncated: stop_reason === 'max_tokens',
       provider: 'claude',
       model: CLAUDE_MODEL,
       timestamp: new Date().toISOString(),
@@ -143,7 +156,7 @@ async function callClaude(transcript, attempt = 1) {
       signal: controller.signal,
       body: JSON.stringify({
         model: CLAUDE_MODEL,
-        max_tokens: 4096,
+        max_tokens: MAX_TOKENS,
         system: SYSTEM_PROMPT,
         messages: [
           {
@@ -169,13 +182,37 @@ async function callClaude(transcript, attempt = 1) {
     }
 
     const result = await response.json();
-    const text = result?.content?.[0]?.text;
 
-    if (!text) {
-      throw new Error('Claude вернул пустой content');
+    if (DEBUG_RAW) {
+      console.log('[Claude] raw response:', JSON.stringify(result).substring(0, 2000));
     }
 
-    return text.trim();
+    const blocks = Array.isArray(result?.content) ? result.content : [];
+    const types = blocks.map(b => b.type).join(',') || 'none';
+
+    // Собираем текст из всех текстовых блоков, а не только из первого:
+    // первым может прийти блок рассуждений (thinking) без поля text.
+    const text = blocks
+      .filter(b => b.type === 'text' && typeof b.text === 'string')
+      .map(b => b.text)
+      .join('\n')
+      .trim();
+
+    console.log(
+      `[Claude] stop_reason=${result?.stop_reason} blocks=[${types}] usage=${JSON.stringify(result?.usage)}`
+    );
+
+    if (!text) {
+      throw new Error(
+        `Claude вернул пустой content (stop_reason=${result?.stop_reason}, blocks=[${types}])`
+      );
+    }
+
+    if (result?.stop_reason === 'max_tokens') {
+      console.warn(`[Claude] ответ обрезан по max_tokens=${MAX_TOKENS}`);
+    }
+
+    return { text, stop_reason: result?.stop_reason, usage: result?.usage };
   } catch (err) {
     if (err.name === 'AbortError') {
       if (attempt < MAX_ATTEMPTS) {
@@ -235,5 +272,5 @@ function sleep(ms) {
 
 app.listen(PORT, () => {
   console.log(`Followup server running on port ${PORT}`);
-  console.log(`Model: ${CLAUDE_MODEL}`);
+  console.log(`Model: ${CLAUDE_MODEL}, max_tokens: ${MAX_TOKENS}`);
 });
